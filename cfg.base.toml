@@ -1,0 +1,7 @@
+[c6-mqtt-fan]
+mqtt_host = ""
+mqtt_user = ""
+mqtt_pass = ""
+wifi_ssid = ""
+wifi_pass = ""
+dev_name = ""
