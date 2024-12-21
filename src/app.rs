@@ -18,7 +18,7 @@ use esp_idf_svc::mqtt::client::{
     EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MqttClientConfiguration,
     MqttProtocolVersion, QoS,
 };
-use esp_idf_svc::sys::{esp_efuse_mac_get_default, EspError};
+use esp_idf_svc::sys::{esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac, EspError, esp_crt_bundle_attach};
 use esp_idf_svc::timer::{EspTaskTimerService, EspTimerService};
 use esp_idf_svc::wifi::{AsyncWifi, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
@@ -51,7 +51,7 @@ pub struct Config {
 
 fn get_mac() -> [u8; 6] {
     let mut mac: [u8; 6] = [0; 6];
-    unsafe { esp_efuse_mac_get_default(mac.as_mut_ptr()); }
+    unsafe { esp_read_mac(mac.as_mut_ptr(), esp_mac_type_t_ESP_MAC_WIFI_STA); }
     mac
 }
 
