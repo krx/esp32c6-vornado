@@ -20,7 +20,6 @@ use esp_idf_svc::mqtt::client::{
 };
 use esp_idf_svc::sys::{esp_efuse_mac_get_default, EspError};
 use esp_idf_svc::timer::{EspTaskTimerService, EspTimerService};
-use esp_idf_svc::tls::X509;
 use esp_idf_svc::wifi::{AsyncWifi, EspWifi};
 use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
 
@@ -111,7 +110,7 @@ impl App {
                 client_id: Some(client_id),
                 username: Some(CONFIG.mqtt_user),
                 password: Some(CONFIG.mqtt_pass),
-                server_certificate: Some(X509::pem_until_nul(CA_BUNDLE)),
+                crt_bundle_attach: Some(esp_crt_bundle_attach),
                 ..Default::default()
             })?;
 
