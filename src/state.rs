@@ -2,7 +2,7 @@ use esp_idf_svc::sys::{EspError, ESP_ERR_INVALID_STATE};
 use log::{error, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::ir;
+use crate::{esp_err, ir};
 
 const SIGNAL_DELAY: u64 = 100;
 
@@ -81,8 +81,8 @@ impl Fan {
     pub async fn set_timer(&mut self, val: Timer) -> Result<Timer, EspError> {
         if !self.power {
             warn!("Fan is off, ignoring timer command");
-            return Err(EspError::from_infallible::<ESP_ERR_INVALID_STATE>());
-       }
+            return esp_err!(ESP_ERR_INVALID_STATE);
+        }
 
         for _ in 0..self.timer.num_until_time(val) {
             if self.rmt.bl_send(ir::TIMER).is_err() {

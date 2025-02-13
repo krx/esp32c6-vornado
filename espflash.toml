@@ -1,0 +1,7 @@
+partition_table = "partition-table.csv"
+
+[connection]
+serial = "/dev/ttyACM0"
+
+[flash]
+size = "4MB"

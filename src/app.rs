@@ -1,33 +1,42 @@
-use crate::consts::*;
-use crate::state;
+use crate::common::*;
 use crate::ir;
+use crate::state;
 
-use anyhow::anyhow;
-use esp_idf_svc::hal::gpio::{AnyIOPin, Input, PinDriver, Pull};
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal, channel::Channel};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex, signal::Signal,
+};
 use embassy_time::Timer;
 use embedded_svc::wifi::{ClientConfiguration, Configuration};
 
-use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::hal::prelude::Peripherals;
-use esp_idf_svc::hal::reset::restart;
-use esp_idf_svc::mqtt::client::{
-    EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MqttClientConfiguration,
-    MqttProtocolVersion, QoS,
+use esp_idf_svc::{
+    eventloop::EspSystemEventLoop,
+    hal::{
+        gpio::{AnyIOPin, Input, PinDriver, Pull},
+        modem::Modem,
+        prelude::Peripherals,
+        reset::restart,
+    },
+    mqtt::client::{
+        EspAsyncMqttClient, EspAsyncMqttConnection, EventPayload, MqttClientConfiguration,
+        MqttProtocolVersion, QoS,
+    },
+    nvs::EspDefaultNvsPartition,
+    sys::{esp_crt_bundle_attach, esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac, EspError},
+    timer::{EspTaskTimerService, EspTimerService},
+    wifi::{AsyncWifi, EspWifi},
 };
-use esp_idf_svc::sys::{esp_mac_type_t_ESP_MAC_WIFI_STA, esp_read_mac, EspError, esp_crt_bundle_attach};
-use esp_idf_svc::timer::{EspTaskTimerService, EspTimerService};
-use esp_idf_svc::wifi::{AsyncWifi, EspWifi};
-use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition};
 
-use ha_mqtt_discovery::mqtt::common::{
-    Availability, AvailabilityCheck, Device, EntityCategory, Qos,
+use ha_mqtt_discovery::{
+    mqtt::{
+        common::{Availability, AvailabilityCheck, Device, EntityCategory, Qos},
+        fan::Fan,
+        select::Select,
+    },
+    Entity,
 };
-use ha_mqtt_discovery::mqtt::select::Select;
-use ha_mqtt_discovery::{mqtt::fan::Fan, Entity};
 
 use log::{error, info, warn};
 use serde_json::Value;
@@ -35,7 +44,7 @@ use static_str_ops::static_format;
 
 #[toml_cfg::toml_config]
 pub struct Config {
-    #[default("localhost")]
+    #[default("")]
     mqtt_host: &'static str,
     #[default("")]
     mqtt_user: &'static str,
@@ -57,7 +66,8 @@ fn get_mac() -> [u8; 6] {
 
 pub enum SignalType {
     Publish,
-    Resubscribe
+    Resubscribe,
+    Log(String)
     // Other
 }
 
@@ -70,6 +80,7 @@ pub struct App {
     pub state: Rc<Mutex<CriticalSectionRawMutex, state::Fan>>,
     _signal: Rc<Channel<CriticalSectionRawMutex, SignalType, CHANNEL_SIZE>>,
     pub timer_signal: Rc<Signal<CriticalSectionRawMutex, state::Timer>>,
+    pub ota_signal: Rc<Signal<CriticalSectionRawMutex, String>>,
 
     pub b_power: Mutex<CriticalSectionRawMutex, PinDriver<'static, AnyIOPin, Input>>,
     pub b_speed: Mutex<CriticalSectionRawMutex, PinDriver<'static, AnyIOPin, Input>>,
@@ -123,6 +134,7 @@ impl App {
             state: Rc::new(Mutex::new(state::Fan::new(rmt))),
             _signal: Rc::new(Channel::new()),
             timer_signal: Rc::new(Signal::new()),
+            ota_signal: Rc::new(Signal::new()),
 
             b_power: Mutex::new(b_power),
             b_speed: Mutex::new(b_speed),
@@ -173,6 +185,15 @@ impl App {
                                 } else {
                                     warn!("Failed to parse json: {data:?}");
                                 }
+                            },
+                            "/admin/reboot" => {
+                                info!("Reboot requested!");
+                                restart();
+                            },
+                            "/admin/ota" => {
+                                let uri = String::from_utf8(data.to_vec()).unwrap();
+                                info!("OTA request: {}", uri);
+                                self.ota_signal.signal(uri);
                             },
                             "homeassistant/status" => self.signal_needs_publish().await,
                             _ => warn!("Unknown topic: {topic}"),
@@ -292,28 +313,39 @@ impl App {
                 SignalType::Resubscribe => {
                     self.subscribe_topics().await;
                 }
+                SignalType::Log(msg) => {
+                    self.mqtt_client.lock().await
+                        .publish(format!("{0}/log", self.base_topic).as_str(),
+                            QoS::AtLeastOnce,
+                            false,
+                            msg.as_bytes()
+                        ).await?;
+
+                }
             }
         }
     }
 
-    fn create_discover_payload(&self, ent: &Entity) -> anyhow::Result<(String, String)> {
+    fn create_discover_payload(&self, ent: &Entity) -> Option<(String, String)> {
         let component = ent.get_component_name();
-        let attributes = ent.get_attributes()?;
+        let attributes = ent.get_attributes().unwrap();
         let object_id = attributes
-            .as_object()
-            .ok_or(anyhow!("entity configuration should be an object"))?
-            .get("uniq_id")
-            .ok_or(anyhow!( "entity configuration should have an attribute 'uniq_id'"))?
-            .as_str()
-            .ok_or(anyhow!("'uniq_id' attribute should be a string"))?;
+            .as_object()?
+            .get("uniq_id")?
+            .as_str()?;
         let topic = format!("{DISCOVERY_PREFIX}/{component}/{object_id}/config");
-        let payload = serde_json::ser::to_string(&attributes)?;
+        let payload = serde_json::ser::to_string(&attributes).unwrap();
 
-        Ok((topic, payload))
+        Some((topic, payload))
     }
 
     pub async fn signal_needs_publish(&self) {
         self._signal.send(SignalType::Publish).await;
+    }
+
+    pub async fn mqtt_log(&self, msg: String) {
+        info!("[MQTT-LOG] {msg}");
+        self._signal.send(SignalType::Log(msg)).await;
     }
 
     async fn subscribe_topics(&self) {
@@ -321,6 +353,7 @@ impl App {
             format!("{DISCOVERY_PREFIX}/status"),
             format!("{0}/+/set", self.base_topic),
             format!("{0}/+/+/set", self.base_topic),
+            format!("{0}/admin/+", self.base_topic),
         ];
 
         let client = self.mqtt_client.clone();
