@@ -54,8 +54,6 @@ pub struct Config {
     wifi_ssid: &'static str,
     #[default("")]
     wifi_pass: &'static str,
-    #[default("")]
-    dev_name: &'static str,
 }
 
 fn get_mac() -> [u8; 6] {
@@ -222,7 +220,6 @@ impl App {
 
     pub async fn mqtt_send_loop(&self) -> Result<(), EspError> {
         let _device = Device::default()
-                      .name(CONFIG.dev_name)
                       .model("173")
                       .add_identifier(self.client_id)
                       .manufacturer("Vornado");
