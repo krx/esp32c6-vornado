@@ -289,6 +289,7 @@ async fn button_loop(app: Rc<App>) {
 
                     // should never fail since power should be on at this point
                     state.set_timer(next_timer).await.unwrap();
+                    app.timer_signal.signal(next_timer);
                 }
             }
         }
