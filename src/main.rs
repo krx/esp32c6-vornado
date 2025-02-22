@@ -5,28 +5,25 @@ mod state;
 
 use app::App;
 use common::{FIRMWARE_DOWNLOAD_CHUNK_SIZE, FIRMWARE_MAX_SIZE, FIRMWARE_MIN_SIZE};
-use embedded_svc::http::{
-    client::{Client, Response},
-    Headers, Method,
-};
+use edge_http::io::client::Connection;
+use edge_nal::{AddrType::IPv4, Dns};
+use edge_nal_std::Stack;
 use http::{header::ACCEPT, Uri};
 use log::{error, info, warn};
 use mime::APPLICATION_OCTET_STREAM;
 use state::Speed;
 
-use std::{rc::Rc, sync::Arc, thread};
+use std::{net::SocketAddr, rc::Rc};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{select, select3, Either, Either3};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Ticker, Timer};
 
 use esp_idf_svc::{
-    hal::reset::restart,
-    http::client::{Configuration, EspHttpConnection},
+    hal::{io::EspIOError, reset::restart},
     log::EspLogger,
-    ota::EspOta,
-    sys::{EspError, ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE, ESP_FAIL},
+    ota::{EspOta, EspOtaUpdate},
+    sys::{EspError, ESP_ERR_IMAGE_INVALID, ESP_ERR_INVALID_RESPONSE, ESP_ERR_NOT_FOUND, ESP_FAIL},
 };
 
 fn set_ota_valid() {
@@ -38,6 +35,7 @@ fn set_ota_valid() {
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     esp_idf_svc::sys::link_patches();
+    let _mounted_eventfs = esp_idf_svc::io::vfs::MountedEventfs::mount(5).unwrap();
     EspLogger::initialize_default();
     set_ota_valid();
 
@@ -45,7 +43,7 @@ async fn main(spawner: Spawner) {
 
     // Keep main task alive
     loop {
-        Timer::after_secs(300).await
+        Timer::after_secs(3600).await
     }
 }
 
@@ -79,14 +77,62 @@ async fn idle_loop(app: Rc<App>) {
     }
 }
 
-fn handle_ota_resp(mut resp: Response<&mut EspHttpConnection>) -> Result<(), EspError> {
-    if resp.status() != 200 {
-        error!("Unexpected HTTP response: {}", resp.status());
+// Small wrapper type around EspOtaUpdate just for adding the edge_nal::io::Write trait
+struct AsyncEspOtaUpdate<'a>(pub EspOtaUpdate<'a>);
+
+impl esp_idf_svc::io::ErrorType for &mut AsyncEspOtaUpdate<'_> {
+    type Error = EspIOError;
+}
+
+impl edge_nal::io::Write for &mut AsyncEspOtaUpdate<'_> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        EspOtaUpdate::write(&mut self.0, buf)?;
+
+        Ok(buf.len())
+    }
+}
+
+async fn handle_ota(uri: Uri) -> Result<(), EspError> {
+    let stack = Stack::new();
+
+    let ip = match stack.get_host_by_name(uri.host().unwrap(), IPv4).await {
+        Ok(it) => it,
+        Err(err) => {
+            error!("Failed to resolve hostname {uri:?}: {err:?}");
+            return esp_err!(ESP_ERR_NOT_FOUND);
+        }
+    };
+    let mut conn_buf = vec![0_u8; 4096];
+    let mut conn: Connection<_> = Connection::new(
+        conn_buf.as_mut_slice(),
+        &stack,
+        SocketAddr::new(ip, uri.port_u16().unwrap()),
+    );
+
+    if let Err(e) = conn.initiate_request(
+        true,
+        edge_http::Method::Get,
+        uri.path_and_query().unwrap().as_str(),
+        &[(ACCEPT.as_str(), APPLICATION_OCTET_STREAM.as_ref())],
+    ).await {
+        error!("Failed to create request: {e:?}");
+        return esp_err!(ESP_FAIL);
+    }
+
+    if let Err(e) = conn.initiate_response().await {
+        error!("Failed to get response: {e:?}");
+        return esp_err!(ESP_FAIL);
+    }
+
+    let (resp, _) = conn.split();
+
+    if resp.code != 200 {
+        error!("Unexpected HTTP response: {}", resp.code);
         return esp_err!(ESP_ERR_INVALID_RESPONSE);
     }
 
     // Check firmware size
-    let file_size = resp.content_len().unwrap_or(0) as usize;
+    let file_size = resp.headers.content_len().unwrap_or_default();
     if file_size <= FIRMWARE_MIN_SIZE {
         error!("Firmware size ({file_size}) is too small!");
         return esp_err!(ESP_ERR_IMAGE_INVALID);
@@ -105,98 +151,47 @@ fn handle_ota_resp(mut resp: Response<&mut EspHttpConnection>) -> Result<(), Esp
         ota.get_update_slot()?.label
     );
 
-    let mut upd = ota.initiate_update()?;
+    let mut upd = AsyncEspOtaUpdate(ota.initiate_update()?);
     let mut buf = vec![0; FIRMWARE_DOWNLOAD_CHUNK_SIZE];
-    let mut total: usize = 0;
-    let ota_res = loop {
-        let n = resp.read(&mut buf).unwrap_or_default();
-        total += n;
-
-        if n > 0 {
-            if let Err(e) = upd.write(&buf[..n]) {
-                error!("Failed to write OTA chunk: {e:?}");
-                break Err(e);
-            }
+    if let Err(e) = esp_idf_svc::io::utils::asynch::copy_len_with_progress(
+        conn,
+        &mut upd,
+        buf.as_mut_slice(),
+        file_size,
+        |copied, len| {
             info!(
                 "OTA progress: {:.2}%",
-                100.0 * total as f32 / file_size as f32
+                100.0 * copied as f32 / (copied + len) as f32
             );
         }
-
-        if total >= file_size {
-            break Ok(());
-        }
-    };
+    ).await {
+        error!("Error while writing OTA: {e:?}");
+        return upd.0.abort();
+    }
 
     // TODO: checksum
 
-    if ota_res.is_err() || total < file_size {
-        error!("Error while writing OTA, aborting");
-        error!("Total of {total} out of {file_size} bytes received");
-        return upd.abort();
-    }
-
     // OTA was successful if we reach this
-    upd.complete()
+    upd.0.complete()
 }
 
 #[embassy_executor::task]
 async fn ota_loop(app: Rc<App>) {
     loop {
-        let mut ota_success: bool = false;
-        match app.ota_signal.wait().await.parse::<Uri>() {
-            Ok(parsed_uri) => {
-                let signal: Arc<Signal<CriticalSectionRawMutex, bool>> = Arc::new(Signal::new());
-                let ref_signal = signal.clone();
-                let req_thread = thread::Builder::new()
-                    .stack_size(1024 * 6)
-                    .spawn(move || -> Result<(), EspError> {
-                        let mut client = Client::wrap(
-                            EspHttpConnection::new(&Configuration {
-                                buffer_size: Some(4096),
-                                ..Default::default()
-                            })?,
-                        );
-
-                        let uri = parsed_uri.to_string();
-                        let headers = [(ACCEPT.as_str(), APPLICATION_OCTET_STREAM.as_ref())];
-                        let res = match client.request(Method::Get, &uri, &headers) {
-                            Ok(req) => {
-                                match req.submit() {
-                                    Ok(resp) => handle_ota_resp(resp),
-                                    Err(e) => {
-                                        error!("Failed to send request! {e:?}");
-                                        esp_err!(ESP_FAIL)
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                error!("Failed to build request! {e:?}");
-                                esp_err!(ESP_FAIL)
-                            }
-                        };
-
-                        // Signal the outer await to exit before this thread is done
-                        ref_signal.signal(res.is_ok());
-                        res
-                    }).expect("Failed to spawn OTA thread");
-
-                // await a signal instead of waiting on the thread so other tasks can keep running
-                ota_success = signal.wait().await;
-                if let Err(e) = req_thread.join() {
-                    error!("Inner OTA thread didn't join properly ???: {e:?}");
-                }
-            }
+        let ota_success = match app.ota_signal.wait().await.parse::<Uri>() {
+            Ok(parsed_uri) => handle_ota(parsed_uri).await,
             Err(e) => {
                 warn!("Failed to parse OTA URI: {e:?}");
+                esp_err!(ESP_FAIL)
             }
         };
 
-        if ota_success {
-            app.mqtt_log("OTA download successful! rebooting to new image...".to_string()).await;
-            restart();
-        } else {
-            app.mqtt_log("OTA failed!".to_string()).await;
+        match ota_success {
+            Ok(_) => {
+                app.mqtt_log("OTA download successful! rebooting to new image...".to_string()).await;
+                restart();
+            }
+            Err(_) => app.mqtt_log("OTA failed!".to_string()).await,
         };
     }
 }

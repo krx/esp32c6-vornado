@@ -42,10 +42,8 @@ struct BLSymbol {
 struct BLPacket {
     _pkt_type: u8,
     _n_repeats: u8,
-    #[br(little)]
-    _len: u16,
-    #[br(parse_with=until_eof)]
-    symbols: Vec<BLSymbol>,
+    #[br(little)] _len: u16,
+    #[br(parse_with=until_eof)] symbols: Vec<BLSymbol>,
     //end: u16 // This ends up globbed into the last `low` pulse. just cap that at 0x7FFF
 }
 

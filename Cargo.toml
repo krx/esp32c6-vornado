@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["Kareem ElFaramawi <kareem02@gmail.com>"]
 edition = "2021"
 resolver = "2"
-rust-version = "1.77"
+rust-version = "1.83"
 
 [[bin]]
 name = "c6-mqtt-fan"
@@ -34,13 +34,16 @@ base64ct = { version = "1.6.0", features = ["std", "alloc"] }
 binrw = "0.14.1"
 serde = { version = "1.0.217", features = ["derive"] }
 embassy-futures = "0.1.1"
-embassy-executor = { version = "0.7.0", features = ["executor-thread", "arch-std"] }
+embassy-executor = { version = "0.7.0", features = ["executor-thread", "arch-std", "task-arena-size-8192"] }
 embassy-time = { version = "0.4.0" }
 embassy-sync = { version = "0.6.2", features = ["std"] }
 static_str_ops = "0.1.2"
 esp-idf-hal = { version = "*", features = ["rmt-legacy"] }
 http = "1.2.0"
 mime = "0.3.17"
+edge-http = { version = "0.5.1", features = ["std"] }
+edge-nal-std = "0.5.0"
+edge-nal = "0.5.0"
 
 [build-dependencies]
 embuild = "0.33"

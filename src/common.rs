@@ -13,5 +13,5 @@ macro_rules! esp_err {
 }
 
 pub const FIRMWARE_DOWNLOAD_CHUNK_SIZE: usize = 1024 * 20;
-pub const FIRMWARE_MAX_SIZE: usize = 0x1f0000; // Max size of each app partition
-pub const FIRMWARE_MIN_SIZE: usize = size_of::<FirmwareInfo>() + 1024;
+pub const FIRMWARE_MAX_SIZE: u64 = 0x1f0000; // Max size of each app partition
+pub const FIRMWARE_MIN_SIZE: u64 = size_of::<FirmwareInfo>() as u64 + 1024;
