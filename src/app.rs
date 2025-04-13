@@ -63,6 +63,7 @@ fn get_mac() -> [u8; 6] {
 }
 
 pub enum SignalType {
+    Discover,
     Publish,
     Resubscribe,
     Log(String)
@@ -208,6 +209,7 @@ impl App {
 
                 EventPayload::Connected(_) => {
                     info!("Connected, resubscribing to topics..");
+                    self._signal.send(SignalType::Discover).await;
                     self._signal.send(SignalType::Resubscribe).await;
                 }
 
@@ -219,6 +221,50 @@ impl App {
     
 
     pub async fn mqtt_send_loop(&self) -> Result<(), EspError> {
+        self.subscribe_topics().await;
+
+        // Send discover and publish initial state when the loop starts
+        self._signal.send(SignalType::Discover).await;
+        self.signal_needs_publish().await;
+
+        loop {
+            match self._signal.receive().await {
+                SignalType::Discover => {
+                    self.send_discover().await?;
+                }
+
+                SignalType::Publish => {
+                    let state = self.state.lock().await;
+                    let mut attrs = serde_json::to_value(&*state).unwrap();
+                    attrs.as_object_mut().unwrap()
+                        .insert(String::from("status"), Value::String(String::from("online")));
+
+                    self.mqtt_client.lock().await
+                        .publish(format!("{0}/fan/state", self.base_topic).as_str(),
+                            QoS::ExactlyOnce,
+                            false,
+                            serde_json::to_string(&attrs).unwrap().as_bytes()
+                        ).await?;
+                }
+
+                SignalType::Resubscribe => {
+                    self.subscribe_topics().await;
+                }
+
+                SignalType::Log(msg) => {
+                    self.mqtt_client.lock().await
+                        .publish(format!("{0}/log", self.base_topic).as_str(),
+                            QoS::AtLeastOnce,
+                            false,
+                            msg.as_bytes()
+                        ).await?;
+
+                }
+            }
+        }
+    }
+
+    async fn send_discover(&self) -> Result<(), EspError> {
         let _device = Device::default()
                       .model("173")
                       .add_identifier(self.client_id)
@@ -275,9 +321,6 @@ impl App {
             )
         ];
 
-        self.subscribe_topics().await;
-
-        // let client = self.mqtt_client.clone();
         for (topic, payload) in entities.map(|ent| self.create_discover_payload(&ent).unwrap()) {
             self.mqtt_client.lock().await
                 .publish(
@@ -287,40 +330,8 @@ impl App {
                     payload.as_bytes()
                 ).await?;
         }
-        
-        // Publish initial state when the loop starts
-        self.signal_needs_publish().await;
 
-        loop {
-            match self._signal.receive().await {
-                SignalType::Publish => {
-                    let state = self.state.lock().await;
-                    let mut attrs = serde_json::to_value(&*state).unwrap();
-                    attrs.as_object_mut().unwrap()
-                        .insert(String::from("status"), Value::String(String::from("online")));
-
-                    self.mqtt_client.lock().await
-                        .publish(format!("{0}/fan/state", self.base_topic).as_str(),
-                            QoS::ExactlyOnce,
-                            false,
-                            serde_json::to_string(&attrs).unwrap().as_bytes()
-                        ).await?;
-                }
-
-                SignalType::Resubscribe => {
-                    self.subscribe_topics().await;
-                }
-                SignalType::Log(msg) => {
-                    self.mqtt_client.lock().await
-                        .publish(format!("{0}/log", self.base_topic).as_str(),
-                            QoS::AtLeastOnce,
-                            false,
-                            msg.as_bytes()
-                        ).await?;
-
-                }
-            }
-        }
+        Ok(())
     }
 
     fn create_discover_payload(&self, ent: &Entity) -> Option<(String, String)> {
